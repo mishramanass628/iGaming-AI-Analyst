@@ -65,8 +65,11 @@ Notes for the hosted app:
      These are app-side limits. Also set a spend limit on the key itself in your provider's console as a hard backstop.
 
 **Reliability:** every LLM call retries automatically on provider overload, rate limits, 5xx errors and timeouts
-(backoff 2 s, 5 s, 10 s). If you pick a **backup model** in step 2 (or set `LLM_BACKUP_MODEL` for My API), the app
-switches to it when the main model stays unavailable, and the insights note which model wrote them.
+(backoff 2 s, 5 s, 10 s), then moves down a chain of fallback models: the **backup model** you pick in step 2, and for
+Gemini up to two more models the key can use (a lighter "flash-lite" and another "flash"; untick to turn off). For My API,
+`LLM_BACKUP_MODEL` can list several models separated by commas. A model that just failed is skipped for 2 minutes, so a
+multi-step agent run doesn't wait through it on every step. The insights note which model wrote them.
+If every model is still busy, the agent keeps its progress and shows **Continue where it stopped**.
 
 3. **Business documents** (choice): upload files, a Google Drive link, or the sample iGaming documents. Can be skipped.
    - Drive, public: share as *Anyone with the link → Viewer* (≤50 files per folder).

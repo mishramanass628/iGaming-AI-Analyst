@@ -217,16 +217,19 @@ def database_step():
 
 # ---------------------------------------------------------------- step 2: LLM
 def _connect_llm(provider: str, model: str, api_key: str, base_url: str | None, label: str,
-                 guard: usage.UsageGuard | None = None, max_tokens: int = 16000, backup_model: str | None = None):
-    backup_model = (backup_model or "").strip() or None
-    if backup_model == model:
-        backup_model = None
+                 guard: usage.UsageGuard | None = None, max_tokens: int = 16000, backup_model: str | None = None,
+                 extra_models: list[str] | None = None):
+    # backup_model may be a comma-separated list (LLM_BACKUP_MODEL for My API): first = backup, rest = extras.
+    names = [m.strip() for m in (backup_model or "").split(",")] + list(extra_models or [])
+    names = [m for m in dict.fromkeys(names) if m and m != model]
+    backup_model, extra_models = (names[0] if names else None), names[1:]
     try:
         cb = [guard] if guard else None
-        primary = llmmod.make_llm(provider, api_key, model, base_url, max_tokens=max_tokens, callbacks=cb)
-        backup = (llmmod.make_llm(provider, api_key, backup_model, base_url, max_tokens=max_tokens, callbacks=cb)
-                  if backup_model else None)
-        llm = llmmod.ResilientLLM(primary, model, backup, backup_model or "")
+        build = lambda m: llmmod.make_llm(provider, api_key, m, base_url, max_tokens=max_tokens, callbacks=cb)
+        primary = build(model)
+        backup = build(backup_model) if backup_model else None
+        llm = llmmod.ResilientLLM(primary, model, backup, backup_model or "",
+                                  extras=[(build(m), m) for m in extra_models])
         with st.spinner("Testing the model…"):
             llmmod.test_llm(llm)
     except usage.UsageLimitError as e:
@@ -245,7 +248,8 @@ def _connect_llm(provider: str, model: str, api_key: str, base_url: str | None, 
         return
     ss.llm, ss.usage_guard = llm, guard
     ss.agent_messages, ss.agent_turns, ss.agent_ws = [], [], None  # history may not suit a new model
-    ss.llm_label = label + (f" (backup: {backup_model})" if backup_model else "")
+    fallbacks = llm.fallback_names
+    ss.llm_label = label + (f" (fallbacks: {', '.join(fallbacks)})" if fallbacks else "")
     ss.whisper_size = ss.get("whisper_choice", "base")
     ss.edit_step = None
     st.rerun()
@@ -278,9 +282,19 @@ def gemini_step():
     default = next((i + 1 for i, m in enumerate(others) if "flash" in m), 0)
     backup = st.selectbox("Backup model (used automatically if the main model is overloaded)",
                           ["None"] + others, index=default, key=f"gemini_backup_{model}")
+    backup = None if backup == "None" else backup
+    extras = llmmod.pick_gemini_fallbacks(models, [model, backup or ""])
+    use_extras = st.checkbox(
+        f"If those are overloaded too, also try: {', '.join(extras)}" if extras else "No other fallback models available",
+        value=bool(extras), disabled=not extras, key="gemini_extras",
+        help="Google's 'high demand' errors often hit several models at once. Lighter models usually still have "
+             "capacity. Each fallback is only used while the models above it are failing.")
+    if model.startswith("gemma"):
+        st.caption("Tip: Gemma models are open models served on shared capacity and are often busy; a Gemini "
+                   "'flash' model is usually more reliable as the main model.")
     if st.button("Connect to LLM", type="primary"):
         _connect_llm(llmmod.GEMINI, model, api_key, None, f"{llmmod.GEMINI} · {model}",
-                     backup_model=None if backup == "None" else backup)
+                     backup_model=backup, extra_models=extras if use_extras else None)
 
 
 def llm_step():
@@ -753,17 +767,23 @@ def render_event_full(e: dict, queries: dict, key: str):
                            key=f"dl_{key}_{q['id']}")
 
 
-def run_agent(question: str, max_queries: int, max_steps: int):
+def run_agent(question: str, max_queries: int, max_steps: int, resume: dict | None = None):
+    """Run the agent on a question. `resume` continues a run that stopped on a provider error, from its last state."""
     if ss.agent_ws is None:
         ss.agent_ws = agentmod.AgentWorkspace(ss.db, ss.docstore)
     ws = ss.agent_ws
     ws.docstore = ss.docstore
     ws.jira = ss.jira
     ws.embedder = embedder() if ss.jira else None
-    ws.max_queries = len(ws.queries) + max_queries  # budget is per question
-    start_event, start_query = len(ws.events), len(ws.queries)
+    if resume:  # same question: keep its query budget, steps and history so far
+        ws.max_queries, max_steps = resume["max_queries"], resume["max_steps"]
+        start_event, start_query = resume["start_event"], resume["start_query"]
+        inputs = {"messages": resume["messages"], "turns": resume["turns"]}
+    else:
+        ws.max_queries = len(ws.queries) + max_queries  # budget is per question
+        start_event, start_query = len(ws.events), len(ws.queries)
+        inputs = {"messages": list(ss.agent_messages) + [HumanMessage(question)]}
     graph = agentmod.build_agent(ss.llm, ws, max_turns=max_steps)
-    inputs = {"messages": list(ss.agent_messages) + [HumanMessage(question)]}
     queries = lambda: {q["id"]: q for q in ws.queries}
     final_state, error, shown = None, None, start_event
     with st.status("The agent is investigating…", expanded=True) as status:
@@ -793,6 +813,11 @@ def run_agent(question: str, max_queries: int, max_steps: int):
         turn["answer"] = None
         turn["error"] = str(error)
         turn["error_kind"] = "warning" if isinstance(error, (usage.UsageLimitError, llmmod.TransientLLMError)) else "error"
+        if isinstance(error, llmmod.TransientLLMError):  # provider hiccup: keep progress so the run can continue
+            state = final_state or inputs
+            turn["resume"] = {"messages": state["messages"], "turns": state.get("turns", 0),
+                              "max_queries": ws.max_queries, "max_steps": max_steps,
+                              "start_event": start_event, "start_query": start_query}
     else:
         ss.agent_messages = final_state["messages"]
         turn["answer"] = agentmod.final_answer(final_state["messages"], ws)
@@ -803,6 +828,9 @@ def run_agent(question: str, max_queries: int, max_steps: int):
 def agent_page():
     st.caption("Ask a business question. The agent reads your business documents, explores the schema, runs "
                "read-only queries, checks surprising numbers and writes an in-depth analysis. Every step is shown.")
+    resume_turn = None
+    if ss.pop("agent_resume", False) and ss.agent_turns and ss.agent_turns[-1].get("resume"):
+        resume_turn = ss.agent_turns.pop()  # re-run below the earlier turns; its steps are carried over
     ws = ss.agent_ws
     queries = {q["id"]: q for q in ws.queries} if ws else {}
     for i, turn in enumerate(ss.agent_turns):
@@ -818,6 +846,13 @@ def agent_page():
                                        "text/markdown", key=f"dl_answer_{i}")
                 elif turn.get("error_kind") == "warning":
                     st.warning(turn["error"])
+                    if turn.get("resume") and i == len(ss.agent_turns) - 1:
+                        done = len(turn["events"])
+                        st.caption(f"The agent's progress is kept ({done} steps, {len(turn['query_ids'])} queries). "
+                                   "Continuing picks up from the last completed step.")
+                        if st.button("▶️ Continue where it stopped", key=f"resume_{i}", type="primary"):
+                            ss.agent_resume = True
+                            st.rerun()
                 else:
                     st.error(f"The agent failed: {turn.get('error')}")
             with tab_steps:
@@ -836,7 +871,11 @@ def agent_page():
         st.rerun()
     if ss.usage_guard:
         st.caption(f"Each step is one AI request against your My API limits; this run may use up to {max_steps + 1}.")
-    if run:
+    if resume_turn is not None:
+        with st.chat_message("user"):
+            st.markdown(resume_turn["question"])
+        run_agent(resume_turn["question"], 0, 0, resume=resume_turn["resume"])
+    elif run:
         run_agent(question.strip(), max_queries, max_steps)
 
 

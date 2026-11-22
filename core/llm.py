@@ -98,27 +98,42 @@ class TransientLLMError(RuntimeError):
 
 
 class ResilientLLM:
-    """Wraps a chat model: retries transient failures with backoff, then switches to a backup model.
+    """Wraps a chat model: retries transient failures with backoff, then moves down a chain of fallback models.
+
+    Chain: primary (retried with `waits`), then `backup`, then each of `extras` (each retried with `backup_waits`).
+    A model that just failed every attempt is "cooling down" for `cooldown` seconds: later calls try the other
+    models first, so a multi-step agent doesn't wait through the same overloaded model on every step.
 
     Exposes .invoke like a LangChain chat model, so the LangGraph nodes (and token streaming via callbacks)
     work unchanged. `last_used` says which model produced the last answer.
     """
 
     def __init__(self, primary, primary_name: str, backup=None, backup_name: str = "",
-                 waits: tuple[float, ...] = (2, 5, 10), backup_waits: tuple[float, ...] = (3,), sleep=None):
+                 waits: tuple[float, ...] = (2, 5, 10), backup_waits: tuple[float, ...] = (3,), sleep=None,
+                 extras: list[tuple] | None = None, cooldown: float = 120, clock=None):
         import time
 
         self.primary, self.primary_name = primary, primary_name
         self.backup, self.backup_name = backup, backup_name
+        self.extras = list(extras or [])  # [(model, name), ...]
         self.waits, self.backup_waits = waits, backup_waits
         self.sleep = sleep or time.sleep
+        self.clock = clock or time.monotonic
+        self.cooldown = cooldown
+        self.cooling: dict[str, float] = {}  # model name -> time it may be tried first again
         self.last_used = primary_name
 
+    @property
+    def fallback_names(self) -> list[str]:
+        return ([self.backup_name] if self.backup is not None else []) + [n for _, n in self.extras]
+
     def bind_tools(self, tools, **kwargs) -> "ResilientLLM":
-        """Same retry/backup behaviour, with tools bound to both models (tool_choice stays 'auto')."""
+        """Same retry/fallback behaviour, with tools bound to every model (tool_choice stays 'auto')."""
         bound = ResilientLLM(self.primary.bind_tools(tools, **kwargs), self.primary_name,
                              self.backup.bind_tools(tools, **kwargs) if self.backup is not None else None,
-                             self.backup_name, self.waits, self.backup_waits, self.sleep)
+                             self.backup_name, self.waits, self.backup_waits, self.sleep,
+                             [(m.bind_tools(tools, **kwargs), n) for m, n in self.extras], self.cooldown, self.clock)
+        bound.cooling = self.cooling  # share cooldowns with the parent
         bound._parent = self
         return bound
 
@@ -127,19 +142,27 @@ class ResilientLLM:
         if getattr(self, "_parent", None) is not None:
             self._parent.last_used = name
 
-    def _plan(self):
-        for i in range(len(self.waits) + 1):
-            yield self.primary, self.primary_name, (self.waits[i] if i < len(self.waits) else None)
+    def _chain(self):
+        chain = [(self.primary, self.primary_name, self.waits)]
         if self.backup is not None:
-            for i in range(len(self.backup_waits) + 1):
-                yield self.backup, self.backup_name, (self.backup_waits[i] if i < len(self.backup_waits) else None)
+            chain.append((self.backup, self.backup_name, self.backup_waits))
+        chain += [(m, n, self.backup_waits) for m, n in self.extras]
+        now = self.clock()
+        # Healthy models first (in configured order), then the ones that failed recently.
+        return sorted(chain, key=lambda c: self.cooling.get(c[1], 0) > now)
+
+    def _plan(self):
+        for model, name, waits in self._chain():
+            for i in range(len(waits) + 1):
+                yield model, name, (waits[i] if i < len(waits) else None), i == len(waits)
 
     def invoke(self, input, config=None, **kwargs):
         last = None
         tried = []
-        for model, name, wait in self._plan():
+        for model, name, wait, final_try in self._plan():
             try:
                 out = model.invoke(input, config, **kwargs)
+                self.cooling.pop(name, None)
                 self._record(name)
                 return out
             except Exception as e:
@@ -147,14 +170,33 @@ class ResilientLLM:
                     raise
                 last = e
                 tried.append(name)
+                if final_try:
+                    self.cooling[name] = self.clock() + self.cooldown
                 if wait:
                     self.sleep(wait)
         models = ", ".join(dict.fromkeys(tried))
-        hint = "" if self.backup is not None else " Tip: add a backup model in step 2 so the app can switch automatically."
+        hint = ("" if self.fallback_names else
+                " Tip: add a backup model in step 2 so the app can switch automatically.")
         raise TransientLLMError(
             f"The AI provider is overloaded or unavailable right now (tried {len(tried)} times: {models}). "
             f"This is usually temporary; try again in a minute.{hint}\n\nLast error: {str(last)[:200]}"
         ) from last
+
+
+def pick_gemini_fallbacks(models: list[str], chosen: list[str], n: int = 2) -> list[str]:
+    """Extra Gemini models to fall back on, from the ones the key can use. Lighter 'flash-lite' / 'flash' models
+    usually have spare capacity when bigger ones are overloaded; Gemma models are skipped (weaker tool calling)."""
+    pool = [m for m in models if m.startswith("gemini") and m not in chosen]
+    ranked = ([m for m in pool if "flash-lite" in m] + [m for m in pool if "flash" in m and "flash-lite" not in m]
+              + [m for m in pool if "flash" not in m])
+    out: list[str] = []
+    for m in ranked:  # at most one model per family, so both fallbacks aren't the same overloaded backend
+        fam = "lite" if "flash-lite" in m else "flash" if "flash" in m else m
+        if all(("lite" if "flash-lite" in o else "flash" if "flash" in o else o) != fam for o in out):
+            out.append(m)
+        if len(out) == n:
+            break
+    return out
 
 
 def content_text(content) -> str:
