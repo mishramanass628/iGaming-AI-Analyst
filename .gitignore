@@ -1,0 +1,7 @@
+.streamlit/secrets.toml
+.venv/
+__pycache__/
+demo/*.duckdb
+.usage/
+.claude/
+.DS_Store
